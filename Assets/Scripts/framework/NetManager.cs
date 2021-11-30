@@ -15,63 +15,81 @@ public static class NetManager
 
     static Queue<ByteArray> writeQueue = new Queue<ByteArray>();
 
+    static bool isConnecting = false;
+
     static bool isClosing = false;
 
-    public delegate void MsgListener(string str);
+    static List<MsgBase> msgList = new List<MsgBase>();
 
-    // listening list
-    private static Dictionary<string, MsgListener> listeners = new Dictionary<string, MsgListener>();
+    static int msgCount = 0;
 
-    // message queue
-    private static Queue<string> msgQueue = new Queue<string>();
+    readonly static int MAX_MESSAGE_FIRE = 10;
 
-    public static void AddListener(string msgName, MsgListener listener)
+    public enum NetEvent
     {
-        if (listeners.ContainsKey(msgName))
+        ConnectSucc = 1,
+        ConnectFail = 2,
+        Close = 3,
+    }
+
+    public delegate void EventListener(string err);
+
+    private static Dictionary<NetEvent, EventListener> eventListeners = new Dictionary<NetEvent, EventListener>();
+
+    public static void AddEventListener(NetEvent netEvent, EventListener listener)
+    {
+        if (eventListeners.ContainsKey(netEvent))
         {
-            listeners[msgName] = listener;
+            eventListeners[netEvent] += listener;
         }
         else
         {
-            listeners.Add(msgName, listener);
+            eventListeners[netEvent] = listener;
         }
     }
 
-    public static string GetDesc()
+    public static void RemoveEventListener(NetEvent netEvent, EventListener listener)
     {
-        if (socket == null)
+        if (eventListeners.ContainsKey(netEvent))
         {
-            return "";
-        }
+            eventListeners[netEvent] -= listener;
 
-        if (!socket.Connected)
+            if (eventListeners[netEvent] == null)
+            {
+                eventListeners.Remove(netEvent);
+            }
+        }
+    }
+
+    public static void FireEvent(NetEvent netEvent, string err)
+    {
+        if (eventListeners.ContainsKey(netEvent))
         {
-            return "";
+            eventListeners[netEvent].Invoke(err);
         }
-
-        return socket.LocalEndPoint.ToString();
     }
 
     public static void Connect(string ip, int port)
     {
-        socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        if (socket != null && socket.Connected)
+        {
+            Debug.Log("Connect fail, already connected!");
+            return;
+        }
+
+        if (isConnecting)
+        {
+            Debug.Log("Connect fail, isConnecting");
+            return;
+        }
+
+        InitState();
+
+        socket.NoDelay = true;
+
+        isConnecting = true;
 
         socket.BeginConnect(ip, port, ConnectCallback, socket);
-    }
-
-    public static void Close()
-    {
-        if (writeQueue.Count > 0)
-        {
-            isClosing = true;
-        }
-        else
-        {
-            if (socket != null && socket.Connected)
-            {
-                socket.Close();
-            }
-        }
     }
 
     private static void ConnectCallback(IAsyncResult ar)
@@ -80,13 +98,19 @@ public static class NetManager
         {
             Socket socket = ar.AsyncState as Socket;
             socket.EndConnect(ar);
-            Debug.Log("Socket Connect Successful");
+
+            Debug.Log("Socket Connect succ ");
+            FireEvent(NetEvent.ConnectSucc, "");
+            isConnecting = false;
 
             socket.BeginReceive(readBuff.bytes, readBuff.writeIdx, readBuff.remain, 0, ReceiveCallback, socket);
+
         }
         catch (SocketException ex)
         {
-            Debug.Log($"Socket Connect Failed: {ex}");
+            Debug.Log($"Socket Connect fail {ex} ");
+            FireEvent(NetEvent.ConnectFail, ex.ToString());
+            isConnecting = false;
         }
     }
 
@@ -96,11 +120,17 @@ public static class NetManager
         {
             Socket socket = ar.AsyncState as Socket;
 
-            var count = socket.EndReceive(ar);
+            int count = socket.EndReceive(ar);
+
+            if (count == 0)
+            {
+                Close();
+                return;
+            }
 
             readBuff.writeIdx += count;
 
-            OnReceiveData();
+            OnRecevieData();
 
             if (readBuff.remain < 8)
             {
@@ -112,18 +142,106 @@ public static class NetManager
         }
         catch (SocketException ex)
         {
-            Debug.Log($"Socket Receive Failed: {ex}");
+            Debug.Log($"Socket Receive fail : {ex}");
         }
     }
 
-    public static void Send(string sendStr)
+    private static void OnReceiveData()
     {
-        if (socket == null)
+        // only length bytes
+        if (readBuff.length <= 2)
         {
             return;
         }
 
-        if (!socket.Connected)
+        short bodyLength = readBuff.ReadInt16();
+
+        // package is not completed
+        if (readBuff.length < bodyLength)
+        {
+            readBuff.readIdx -= 2;
+            return;
+        }
+
+        int nameCount = 0;
+        string protoName = MsgBase.DecodeName(readBuff.bytes, readBuff.readIdx, out nameCount);
+
+        if (string.IsNullOrEmpty(protoName))
+        {
+            Debug.Log("OnReceiveData MsgBase.DecodeName fail");
+            return;
+        }
+
+        readBuff.readIdx += nameCount;
+
+        int bodyCount = bodyLength - nameCount;
+        MsgBase msgBase = MsgBase.Decode(protoName, readBuff.bytes, readBuff.readIdx, bodyCount);
+
+        readBuff.readIdx += bodyCount;
+        readBuff.CheckAndMoveBytes();
+
+        lock (msgList)
+        {
+            msgList.Add(msgBase);
+        }
+
+        msgCount++;
+
+        if (readBuff.length > 2)
+        {
+            // work utill return
+            OnReceiveData();
+        }
+    }
+
+    private static void InitState()
+    {
+        socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+
+        readBuff = new ByteArray();
+
+        writeQueue = new Queue<ByteArray>();
+
+        isConnecting = false;
+
+        isClosing = false;
+
+        msgList = new List<MsgBase>();
+
+        msgCount = 0;
+    }
+
+    public static void Close()
+    {
+        if (socket == null || !socket.Connected)
+        {
+            return;
+        }
+
+        if (isConnecting)
+        {
+            return;
+        }
+
+        if (writeQueue.Count > 0)
+        {
+            isClosing = true;
+        }
+        else
+        {
+            socket.Close();
+            FireEvent(NetEvent.Close, "");
+        }
+    }
+
+    public static void Send(MsgBase msg)
+    {
+        if (socket == null || !socket.Connected)
+        {
+            return;
+        }
+
+        if (isConnecting)
         {
             return;
         }
@@ -133,34 +251,30 @@ public static class NetManager
             return;
         }
 
-        byte[] bodyBytes = System.Text.Encoding.UTF8.GetBytes(sendStr);
+        byte[] nameBytes = MsgBase.EncodeName(msg);
+        byte[] bodyBytes = MsgBase.Encode(msg);
 
-        // add length bytes into package
-        short len = (short)bodyBytes.Length;
-        byte[] lenBytes = BitConverter.GetBytes(len);
+        int len = nameBytes.Length + bodyBytes.Length;
+        byte[] sendBytes = new byte[2 + len];
 
-        // length bytes default writen with little endian 
-        if (!BitConverter.IsLittleEndian)
-        {
-            lenBytes.Reverse();
-        }
+        sendBytes[0] = (byte)(len % 256);
+        sendBytes[1] = (byte)(len / 256);
 
-        byte[] sendBytes = lenBytes.Concat(bodyBytes).ToArray();
+        Array.Copy(nameBytes, 0, sendBytes, 2, nameBytes.Length);
+        Array.Copy(bodyBytes, 0, sendBytes, 2 + nameBytes.Length, bodyBytes.Length);
 
         ByteArray ba = new ByteArray(sendBytes);
-        var count = 0;
+        int count = 0;
 
-        // avoid multi theads problem
         lock (writeQueue)
         {
             writeQueue.Enqueue(ba);
             count = writeQueue.Count;
         }
 
-        // if queue only has one package , send it immediately
         if (count == 1)
         {
-            socket.BeginSend(ba.bytes, ba.readIdx, ba.length, 0, SendCallback, socket);
+            socket.BeginSend(sendBytes, 0, sendBytes.Length, 0, SendCallback, socket);
         }
     }
 
@@ -169,6 +283,11 @@ public static class NetManager
         try
         {
             Socket socket = ar.AsyncState as Socket;
+
+            if (socket == null || !socket.Connected)
+            {
+                return;
+            }
 
             var count = socket.EndSend(ar);
 
@@ -207,63 +326,6 @@ public static class NetManager
         catch (SocketException ex)
         {
             Debug.Log($"Socket Send Failed: {ex}");
-        }
-    }
-
-    public static void Update()
-    {
-        if (msgQueue.Count == 0)
-        {
-            return;
-        }
-
-        var msgStr = msgQueue.Dequeue();
-
-        if (string.IsNullOrEmpty(msgStr))
-        {
-            return;
-        }
-
-        var split = msgStr.Split('|');
-        var msgName = split[0];
-        var msgArgs = split[1];
-
-        Debug.Log($"NetManager -> Dequeue -> {msgName} -> {msgArgs}");
-
-        if (listeners.ContainsKey(msgName))
-        {
-            listeners[msgName](msgArgs);
-        }
-    }
-
-    private static void OnReceiveData()
-    {
-        // only length bytes
-        if (readBuff.length <= 2)
-        {
-            return;
-        }
-
-        short bodyLength = readBuff.ReadInt16();
-
-        // package is not completed
-        if (readBuff.length < bodyLength)
-        {
-            readBuff.readIdx -= 2;
-            return;
-        }
-
-        byte[] stringBytes = new byte[bodyLength];
-        readBuff.Read(stringBytes, 0, bodyLength);
-
-        string recvStr = System.Text.Encoding.UTF8.GetString(stringBytes);
-
-        msgQueue.Enqueue(recvStr);
-
-        if (readBuff.length > 2)
-        {
-            // work utill return
-            OnReceiveData();
         }
     }
 }
