@@ -25,6 +25,10 @@ public static class NetManager
 
     readonly static int MAX_MESSAGE_FIRE = 10;
 
+    public delegate void MsgListerner(MsgBase msgBase);
+
+    private static Dictionary<string, MsgListerner> msgListeners = new Dictionary<string, MsgListerner>();
+
     public enum NetEvent
     {
         ConnectSucc = 1,
@@ -35,6 +39,15 @@ public static class NetManager
     public delegate void EventListener(string err);
 
     private static Dictionary<NetEvent, EventListener> eventListeners = new Dictionary<NetEvent, EventListener>();
+
+    // Heart beat check
+    public static bool isUsePing = true;
+
+    public static int pingInterval = 30;
+
+    static float lastPingTime = 0;
+
+    static float lastPongTime = 0;
 
     public static void AddEventListener(NetEvent netEvent, EventListener listener)
     {
@@ -66,6 +79,39 @@ public static class NetManager
         if (eventListeners.ContainsKey(netEvent))
         {
             eventListeners[netEvent].Invoke(err);
+        }
+    }
+
+    public static void AddMsgListener(string msgName, MsgListerner listener)
+    {
+        if (msgListeners.ContainsKey(msgName))
+        {
+            msgListeners[msgName] += listener;
+        }
+        else
+        {
+            msgListeners[msgName] = listener;
+        }
+    }
+
+    public static void RemoveMsgListener(string msgName, MsgListerner listener)
+    {
+        if (msgListeners.ContainsKey(msgName))
+        {
+            msgListeners[msgName] -= listener;
+
+            if (msgListeners[msgName] == null)
+            {
+                msgListeners.Remove(msgName);
+            }
+        }
+    }
+
+    public static void FireMsg(string msgName, MsgBase msgBase)
+    {
+        if (msgListeners.ContainsKey(msgName))
+        {
+            msgListeners[msgName].Invoke(msgBase);
         }
     }
 
@@ -130,7 +176,7 @@ public static class NetManager
 
             readBuff.writeIdx += count;
 
-            OnRecevieData();
+            OnReceiveData();
 
             if (readBuff.remain < 8)
             {
@@ -208,7 +254,15 @@ public static class NetManager
 
         msgList = new List<MsgBase>();
 
-        msgCount = 0;
+
+        lastPingTime = Time.time;
+
+        lastPongTime = Time.time;
+
+        if (!msgListeners.ContainsKey(nameof(MsgPong)))
+        {
+            AddMsgListener(nameof(MsgPong), OnMsgPong);
+        }
     }
 
     public static void Close()
@@ -327,5 +381,69 @@ public static class NetManager
         {
             Debug.Log($"Socket Send Failed: {ex}");
         }
+    }
+
+    public static void Update()
+    {
+        MsgUpdate();
+        PingUpdate();
+    }
+
+    private static void MsgUpdate()
+    {
+        if (msgCount == 0)
+        {
+            return;
+        }
+
+        for (int i = 0; i < MAX_MESSAGE_FIRE; i++)
+        {
+            MsgBase msgBase = null;
+
+            lock (msgList)
+            {
+                if (msgList.Count > 0)
+                {
+                    msgBase = msgList[0];
+                    msgList.RemoveAt(0);
+                    msgCount--;
+                }
+            }
+
+            if (msgBase != null)
+            {
+                FireMsg(msgBase.protoName, msgBase);
+            }
+            else
+            {
+                break;
+            }
+        }
+    }
+
+    private static void PingUpdate()
+    {
+        if (!isUsePing)
+        {
+            return;
+        }
+
+        if (Time.time - lastPingTime > pingInterval)
+        {
+            MsgPing msgPing = new MsgPing();
+            Send(msgPing);
+            lastPingTime = Time.time;
+        }
+
+        // heart beat respone over time
+        if (Time.time - lastPongTime > pingInterval * 4)
+        {
+            Close();
+        }
+    }
+
+    private static void OnMsgPong(MsgBase msgBase)
+    {
+        lastPongTime = Time.time;
     }
 }

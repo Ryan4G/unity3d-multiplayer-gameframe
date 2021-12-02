@@ -11,6 +11,16 @@ public class Test : MonoBehaviour
         NetManager.AddEventListener(NetManager.NetEvent.ConnectSucc, OnConnectSucc);
         NetManager.AddEventListener(NetManager.NetEvent.ConnectFail, OnConnectFail);
         NetManager.AddEventListener(NetManager.NetEvent.Close, OnConnectClose);
+        NetManager.AddMsgListener("MsgMove", OnMsgMove);
+    }
+
+    private void OnMsgMove(MsgBase msgBase)
+    {
+        MsgMove msgMove = (MsgMove)msgBase;
+
+        Debug.Log($"OnMsgMove msg.x = {msgMove.x}");
+        Debug.Log($"OnMsgMove msg.y = {msgMove.y}");
+        Debug.Log($"OnMsgMove msg.z = {msgMove.z}");
     }
 
     private void OnConnectClose(string err)
@@ -31,7 +41,7 @@ public class Test : MonoBehaviour
     // Update is called once per frame
     void Update()
     {
-        
+        NetManager.Update();
     }
 
     public void OnConnectClick()
